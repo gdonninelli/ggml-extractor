@@ -1,0 +1,7 @@
+build/
+*.npy
+*.tmp-*
+.DS_Store
+.idea/
+.vscode/
+cmake-build-*/
