@@ -2,9 +2,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![C++](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
-[![llama.cpp](https://img.shields.io/badge/engine-llama.cpp-green.svg)](https://github.com/ggerganov/llama.cpp)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/ggerganov/llama.cpp)
-[![Version](https://img.shields.io/badge/version-0.1.0-orange.svg)](include/ggml_extractor/version.hpp)
+[![llama.cpp](https://img.shields.io/badge/engine-llama.cpp-green.svg)](https://github.com/ggml-org/llama.cpp)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/ggml-org/llama.cpp)
+[![Version](https://img.shields.io/badge/version-0.2.0-orange.svg)](include/ggml_extractor/version.hpp)
 
 <p align="center">
   <img src="assets/logo.png" alt="ggml-extractor logo — stacked LLM layers with the selected token extracted into a .npy grid" width="580"/>
@@ -12,106 +12,122 @@
 
 > **Created by Giulio Enzo Donninelli and [Adversal.ai](https://adversal.ai).**
 
-A tiny, neat, open-source C++17 library that extracts hidden states for
-**specific tokens at specific layers** from any `llama.cpp` / ggml inference
-run — and saves them as NumPy `.npy` files.
+A small C++17 library that reads **hidden states for specific tokens at
+specific layers** out of a live `llama.cpp` inference run — without giving up
+ordinary inference on the same model.
 
-You instantiate **one object**, pass it a vector of
-*(tensor name → token position)* requests, plug it into a `llama_context`,
-decode, and save. Prefill (decode) and autoregressive generation (inference)
-are both first-class.
+Load the model once. Serve normal completions from it. When you need
+activations instead, arm a capture for a decode or two and take the result in
+memory. Text prompts and image prompts go through the same path.
 
 ```cpp
-#include "ggml_extractor/extractor.hpp"
-#include "ggml_extractor/llama_session.hpp"
-using namespace ggml_extractor;
+auto model = Model::load("gemma4.gguf");          // once per process
+SessionOptions options;
+options.n_ctx = 8192;
+Session session(model, options);                  // context created once
 
-HiddenStateExtractor extractor({
-    {"inp_scaled", TokenSelector::last()},   // input embeddings, last prompt token
-    {"l_out-20",   TokenSelector::last()},   // layer 20 output, last token
+// ordinary inference — nothing armed, full speed
+session.decode(0, model->tokenize("hello"));
+int32_t next = session.sample_greedy();
+
+// activations — same model, same context, same KV cache
+HiddenStateCapture capture({
+    {"inp_scaled", TokenSelector::last()},
+    {"l_out-20",   TokenSelector::last()},
     {"l_out-29",   TokenSelector::second_last()},
 });
-
-LlamaSession session("model.gguf", extractor);
-session.decode(session.tokenize("hello world"));
-extractor.require_frame_complete();
-extractor.commit_frame();
-extractor.save_npy("hidden_states.npy");  // shape: (1, 3, n_embd)
+{
+    auto armed = session.arm(capture);
+    session.decode(0, model->tokenize("The cat sat on the mat."));
+    capture.commit_frame();
+}
+HiddenStates states = capture.take();             // (1, 3, n_embd), in memory
 ```
 
 ---
 
 ## Table of contents
 
-- [ggml-extractor](#ggml-extractor)
-  - [Table of contents](#table-of-contents)
-  - [Why](#why)
-  - [Features](#features)
-  - [Requirements](#requirements)
-  - [Build](#build)
-  - [Usage](#usage)
-    - [1. Prefill — one prompt](#1-prefill--one-prompt)
-    - [2. Batch — many prompts, one file](#2-batch--many-prompts-one-file)
-    - [3. Generation — current generated token](#3-generation--current-generated-token)
-    - [4. Raw ggml — no llama.cpp wrapper](#4-raw-ggml--no-llamacpp-wrapper)
-  - [API reference](#api-reference)
-    - [`TokenSelector` — `include/ggml_extractor/token_selector.hpp`](#tokenselector--includeggml_extractortoken_selectorhpp)
-    - [`ExtractionRequest` — `include/ggml_extractor/extraction_request.hpp`](#extractionrequest--includeggml_extractorextraction_requesthpp)
-    - [`HiddenStateExtractor` — `include/ggml_extractor/extractor.hpp`](#hiddenstateextractor--includeggml_extractorextractorhpp)
-    - [`LlamaSession` — `include/ggml_extractor/llama_session.hpp`](#llamasession--includeggml_extractorllama_sessionhpp)
-    - [`NpyWriter` — `include/ggml_extractor/npy_writer.hpp`](#npywriter--includeggml_extractornpy_writerhpp)
-  - [Specification](#specification)
-    - [Tensor naming](#tensor-naming)
-    - [Token indexing](#token-indexing)
-    - [Shapes](#shapes)
-    - [`.npy` format](#npy-format)
-    - [Lifecycle contract](#lifecycle-contract)
-    - [Validation performed per tensor](#validation-performed-per-tensor)
-    - [Context \& positions (generation)](#context--positions-generation)
-    - [Threading \& determinism](#threading--determinism)
-  - [Examples](#examples)
-  - [Project layout](#project-layout)
-  - [Provenance](#provenance)
-  - [License](#license)
-  - [Authors](#authors)
+- [Why](#why)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Build](#build)
+- [Usage](#usage)
+  - [1. One prompt](#1-one-prompt)
+  - [2. Many prompts, one session](#2-many-prompts-one-session)
+  - [3. Generation — every generated token](#3-generation--every-generated-token)
+  - [4. Images](#4-images)
+  - [5. Raw ggml — no llama_context](#5-raw-ggml--no-llama_context)
+- [API reference](#api-reference)
+- [Specification](#specification)
+- [Examples](#examples)
+- [Project layout](#project-layout)
+- [Upgrading from 0.1.x](#upgrading-from-01x)
+- [License](#license)
+- [Authors](#authors)
 
 ---
 
 ## Why
 
 `llama.cpp` exposes per-tensor callbacks (`cb_eval`), and ggml tensors carry
-canonical names (e.g. `inp_scaled`, `l_out-20`). Capturing the right row of the
+canonical names (`inp_scaled`, `l_out-20`, …). Copying the right row of the
 right tensor at the right decode step is only a few dozen lines — but every
 project re-implements it slightly differently, with slightly different bugs
-(non-contiguous rows, wrong token index, silent overwrites of `.npy`).
+(non-contiguous rows, wrong token index, silent `.npy` overwrites).
 
-`ggml-extractor` is the generalized, tested shape of two proven tools
-(`extract_hidden_states`, `extract_query_hidden_states`): exact-name matching,
-from-end token indexing, atomic `.npy` output — packaged as a plug-and-play
-object-oriented library.
+Version 0.1 packaged that logic as a library, but assumed a one-shot CLI: the
+model, the context and the output buffer were all owned by the same object,
+the KV cache was cleared on every prefill, and results only went to disk.
+Version 0.2 splits those lifetimes apart so the same model can serve inference
+and extraction in one long-running process:
+
+| Layer | Lifetime | Holds |
+|---|---|---|
+| `Model` | process | the weights — shared by every session |
+| `Session` | worker thread | one `llama_context` + KV cache + the installed callback |
+| `HiddenStateCapture` | one request | which tensors to grab, and the results |
+| `Multimodal` | process | the vision/audio projector, bound to a `Model` |
 
 ---
 
-## Features
+## How it works
 
-- 🧩 **Object-oriented, plug-and-play** — one `HiddenStateExtractor`
-  constructed with `std::vector<ExtractionRequest>`; attach to any
-  `llama_context_params` via `attach()`.
-- 🎯 **Exact tensor names** — the same strings that describe tensors in the
-  ggml file / graph (`inp_scaled`, `l_out-20`, …). Case-sensitive equality,
-  no glob magic.
-- 🔢 **Per-request token selection** — `last()`, `second_last()`,
-  `third_last()`, `from_end(k)`, `generated()`. One decode can capture the
-  last token of layer 20 *and* the second-to-last of layer 25.
-- 🔁 **Decode + inference** — prefill batches *and* token-by-token generation
-  loops with correct KV-cache position tracking (`decode` / `decode_one`).
-- 💾 **Safe `.npy` output** — float32 `<f4`, v1.0, C-order, 64-byte aligned
-  header, streaming or one-shot API, atomic publish, never overwrites.
-- 🧵 **Explicit failure modes** — `noexcept` callback records errors;
-  `require_frame_complete()` re-throws with tensor + token details; finite
-  checks; overflow checks; width-consistency checks.
-- 📦 **Minimal dependencies** — C++17, `llama.cpp` (as `LLAMA_CPP_DIR`),
-  threads. No Python, no frameworks.
+`llama.cpp` copies `cb_eval` into the context when the context is created and
+offers no setter, so extraction cannot be wired in after the fact. `Session`
+therefore installs **its own trampoline once**, up front, and switches
+behaviour behind it: `arm()` points the trampoline at a capture, and the
+guard's destructor points it back at nothing.
+
+Leaving the callback installed is close to free. In the ggml scheduler, when
+the `ask` phase answers "no" for every node, the scan runs to the end of the
+graph split and computes it in a *single* submission — so a disarmed session
+costs one trivial callback per graph node plus one extra backend
+synchronisation per split. Graph reuse and operator fusion are unaffected.
+
+When a capture **is** armed the scheduler chops the split into chunks and
+synchronises after each one. That cost is inherent to `cb_eval` and applies
+only while you are extracting. Measured on the CPU backend (Gemma 3 1B Q8_0,
+64 decode steps per configuration, same process):
+
+| | per-token decode |
+|---|---|
+| disarmed | 27.8 ms |
+| armed, 1 layer | 26.8 ms |
+| armed, all 26 layers | 27.0 ms |
+
+i.e. within measurement noise, and flat in the number of layers captured —
+on CPU the per-chunk synchronise is nearly free. Expect a real cost on CUDA,
+where chunking defeats CUDA graphs and forces genuine device syncs.
+
+Arming is also numerically inert: an armed prefill and an unarmed prefill of
+the same prompt produce **bit-identical logits** across all 262,144 vocab
+entries, and disarming returns to the same path.
+
+Two contexts (a fast one plus an instrumented one) would avoid even that, but
+they cannot share a KV cache: `llama_context_params::ctx_other` is gated to
+draft/assistant architectures, so a second context means double the KV memory
+and re-prefilling every prompt. One context is the better trade.
 
 ---
 
@@ -121,236 +137,267 @@ object-oriented library.
 |---|---|
 | C++17 compiler | Clang 14+, GCC 11+, MSVC 19.30+ |
 | CMake ≥ 3.20 | |
-| llama.cpp checkout | Any recent revision exposing `cb_eval`, `llama_batch_get_one`, `llama_get_logits`, `llama_synchronize` |
-| Threads | `find_package(Threads)` |
+| llama.cpp checkout | Recent revision exposing `cb_eval`, `llama_memory_*`, `llama_n_ctx_seq`, and (for images) `tools/mtmd` with `LLAMA_BUILD_MTMD` |
 | GGUF model | Any architecture (optional `required_architecture` guard) |
+| `mmproj` GGUF | Only for image/audio input — a separate file, see below |
+
+Verified against llama.cpp `df03399` (2026-09-10).
 
 ---
 
 ## Build
 
 ```bash
-git clone https://github.com/<you>/ggml-extractor.git
-cmake -S ggml-extractor -B ggml-extractor/build \
-  -DLLAMA_CPP_DIR=/path/to/llama.cpp \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build ggml-extractor/build -j
+git clone --depth 1 https://github.com/ggml-org/llama.cpp.git ../llama.cpp
+
+# text-only model (no vision projector) — smaller, faster build
+cmake -S . -B build \
+  -DLLAMA_CPP_DIR=../llama.cpp \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_EXTRACTOR_MULTIMODAL=OFF
+cmake --build build -j
+
+# vision model (you have an mmproj-*.gguf) — adds libmtmd
+cmake -S . -B build -DLLAMA_CPP_DIR=../llama.cpp \
+  -DCMAKE_BUILD_TYPE=Release -DGGML_EXTRACTOR_MULTIMODAL=ON
+cmake --build build -j
 ```
 
-This produces:
+| Option | Default | Effect |
+|---|---|---|
+| `LLAMA_CPP_DIR` | *(required)* | llama.cpp source checkout |
+| `GGML_EXTRACTOR_MULTIMODAL` | `ON` | Build `libmtmd` and `Multimodal`. Turn it `OFF` for text-only models: `libmtmd` is a large library (every vision/audio architecture llama.cpp supports) and is useless without a projector file. |
 
-| Target | Binary |
-|---|---|
-| `ggml_extractor` | static library |
-| `prefill_example` | `build/prefill_example` |
-| `batch_example` | `build/batch_example` |
-| `generate_example` | `build/generate_example` |
-| `raw_ggml_example` | `build/raw_ggml_example` |
-
-Install (optional):
+All five examples build in either configuration —
+`service_example`'s image stages are `#ifdef`-guarded on the
+`GGML_EXTRACTOR_MULTIMODAL` define the library exports.
 
 ```bash
-cmake --install ggml-extractor/build --prefix /usr/local
+cmake --install build --prefix /usr/local   # optional
+```
+
+### Does my model need `GGML_EXTRACTOR_MULTIMODAL`?
+
+Only if you have a **separate** `mmproj-*.gguf`. llama.cpp never packs the
+vision tower into the text GGUF: `convert_hf_to_gguf.py --mmproj` writes it to
+its own file, and `mtmd_init_from_file()` takes that filename as a required
+argument. So:
+
+- text-only model, or a vision model whose projector you did not convert or
+  download → `-DGGML_EXTRACTOR_MULTIMODAL=OFF`, and images are unavailable
+- text GGUF **and** its `mmproj-*.gguf` → `ON`, and `Multimodal` works
+
+To check what you have, look for a projector type in the file's metadata:
+
+```bash
+strings model.gguf | grep -m1 clip.projector_type   # nothing = no vision tower
 ```
 
 ---
 
 ## Usage
 
-### 1. Prefill — one prompt
+### 1. One prompt
 
-Decode-phase extraction. `from_end(0)` is the last prompt token,
-`from_end(1)` the second-to-last, and so on.
+`from_end(0)` (= `last()`) is the final prompt token, `from_end(1)` the one
+before it, and so on.
 
 ```cpp
-HiddenStateExtractor extractor({
+auto model = Model::load("model.gguf");
+Session session(model);
+
+HiddenStateCapture capture({
     {"inp_scaled", TokenSelector::last()},
     {"l_out-20",   TokenSelector::last()},
     {"l_out-25",   TokenSelector::from_end(1)},
 });
-LlamaSession session("model.gguf", extractor);
-
-session.decode(session.tokenize("The cat sat on the mat."));
-extractor.require_frame_complete();  // throws if any row is missing
-extractor.commit_frame();            // 1 frame
-extractor.save_npy("prefill.npy");   // shape: (1, 3, n_embd)
+{
+    auto armed = session.arm(capture);
+    session.decode(0, model->tokenize("The cat sat on the mat."), false);
+    capture.commit_frame();
+}
+HiddenStates states = capture.take();   // (1, 3, n_embd)
+states.save_npy("prefill.npy");         // optional
 ```
-
-CLI:
 
 ```bash
-./build/prefill_example -m model.gguf -p "hello world" -o out.npy
-# → wrote out.npy shape=(3, 3840)
+./build/prefill_example -m model.gguf -p "hello world" -o out.npy -l 20,25,29
 ```
 
-### 2. Batch — many prompts, one file
+### 2. Many prompts, one session
 
-Each prompt is an independent prefill (KV memory cleared between rows); each
-contributes one frame.
+The model and context are created once; `reset(seq)` frees the sequence's KV
+cache between prompts.
 
 ```cpp
-HiddenStateExtractor extractor({
+HiddenStateCapture capture({
     {"l_out-20", TokenSelector::last()},
-    {"l_out-20", TokenSelector::second_last()},  // same tensor, two rows
+    {"l_out-20", TokenSelector::second_last()},   // same tensor, two rows
     {"l_out-29", TokenSelector::last()},
 });
-LlamaSession session(model, extractor);
 
-for (auto& prompt : prompts) {
-    session.decode(session.tokenize(prompt));
-    extractor.require_frame_complete();
-    extractor.commit_frame();
+auto armed = session.arm(capture);
+for (const auto& prompt : prompts) {
+    session.reset(0);
+    session.decode(0, model->tokenize(prompt), false);
+    capture.commit_frame();                       // one frame per prompt
 }
-extractor.save_npy("batch.npy");  // (n_prompts, 3, n_embd)
+HiddenStates states = capture.take();             // (n_prompts, 3, n_embd)
 ```
 
-```bash
-./build/batch_example -m model.gguf -o batch.npy -p "first" -p "second"
-```
-
-### 3. Generation — current generated token
-
-Inference-phase extraction. Requests use `TokenSelector::generated()`; the
-session preserves the KV cache and advances the position counter, so each
-`decode_one()` captures the hidden state of **the token just generated**.
+### 3. Generation — every generated token
 
 ```cpp
-HiddenStateExtractor extractor({
+HiddenStateCapture capture({
     {"l_out-20", TokenSelector::generated()},
     {"l_out-29", TokenSelector::generated()},
 });
-LlamaSessionOptions opts;
-opts.n_ctx = 4096;  // fixed size → KV cache survives across steps
-LlamaSession session(model, extractor, opts);
+auto armed = session.arm(capture);
 
-// Prefill (frame discarded, position retained).
-session.decode(session.tokenize(prompt));
-extractor.require_frame_complete();
-extractor.begin_frame();  // drop prefill capture, keep KV + position
+session.decode(0, model->tokenize(prompt));
+capture.begin_frame();                  // drop the prefill frame, keep the KV cache
 
-// Autoregressive loop (greedy argmax shown; use any sampler):
-const llama_vocab* vocab = llama_model_get_vocab(session.model_handle());
 for (int step = 0; step < n_predict; ++step) {
-    int32_t next = argmax(llama_get_logits(session.context_handle()));
-    session.decode_one(next);          // copies the GENERATED row
-    extractor.require_frame_complete();
-    extractor.commit_frame();          // 1 frame per generated token
-    if (next == llama_vocab_eos(vocab)) break;
+    int32_t next = session.sample_greedy();
+    if (model->is_eog(next)) break;
+    session.decode_one(0, next);
+    capture.commit_frame();             // one frame per generated token
 }
-extractor.save_npy("generated.npy");   // (n_generated, 2, n_embd)
+HiddenStates states = capture.take();   // (n_generated, 2, n_embd)
 ```
 
-```bash
-./build/generate_example -m model.gguf -p "The capital of Italy is" -o gen.npy -n 32
-```
+`generated()` is offset 0 of the current decode — identical to `last()` at the
+tensor level. The separate factory exists so prefill and generation intent are
+visible at the call site.
 
-> `generated()` is encoded as offset 0 (the last row of the current decode),
-> identical to `last()` at the tensor level. The distinct factory exists so
-> prefill vs. generate intent is visible at the call site.
+### 4. Images
 
-### 4. Raw ggml — no llama.cpp wrapper
+Requires a separate `mmproj-*.gguf` and a build with
+`-DGGML_EXTRACTOR_MULTIMODAL=ON` — see
+[Does my model need it?](#does-my-model-need-ggml_extractor_multimodal).
 
-`HiddenStateExtractor` is model-agnostic. Any loop visiting every
-`ggml_tensor*` can drive it with the two-phase `ask` protocol:
+`Multimodal` owns only the projector; the text weights stay in the `Model`.
+Because `eval()` runs `llama_decode` on the session's context, an armed
+capture sees an image prompt exactly as it sees a text prefill.
 
 ```cpp
-HiddenStateExtractor extractor({
-    {"inp_scaled", TokenSelector::last()},
-    {"l_out-7",    TokenSelector::from_end(1)},
-});
+Multimodal vision(model, "mmproj-gemma4.gguf");
 
-// Ask phase (graph construction): keep requested tensors.
-for (ggml_tensor* t : graph_tensors)
-    if (extractor.filter(t, /*ask=*/true)) { /* retain t */ }
+std::string prompt = vision.marker() + "\nWhat is in this picture?";
 
-evaluate_graph();
+// inference
+vision.eval(session, 0, prompt, {"photo.jpg"});
+int32_t next = session.sample_greedy();
 
-// Copy phase:
-extractor.begin_frame();  // (or before evaluation — flags are per-frame)
-for (ggml_tensor* t : graph_tensors)
-    extractor.filter(t, /*ask=*/false);
-
-extractor.require_frame_complete();
-extractor.commit_frame();
-extractor.save_npy("raw.npy");
+// activations for the same prompt
+session.reset(0);
+{
+    auto armed = session.arm(capture);
+    vision.eval(session, 0, prompt, {"photo.jpg"}, /*logits_last=*/false);
+    capture.commit_frame();             // the last prompt token, image attended
+}
 ```
 
-Equivalently, pass `HiddenStateExtractor::callback` directly as
-`llama_context_params::cb_eval` (this is what `attach()` does) with
-`cb_eval_user_data` pointing at your extractor.
+`examples/05_service.cpp` runs all four combinations — text generation, text
+extraction, image generation, image extraction — against one loaded model.
+
+### 5. Raw ggml — no `llama_context`
+
+`HiddenStateCapture` only needs the two-phase protocol, so any loop over an
+evaluated graph can drive it:
+
+```cpp
+capture.begin_frame();
+for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+    ggml_tensor* node = ggml_graph_node(graph, i);
+    if (capture.filter(node, /*ask=*/true)) {
+        capture.filter(node, /*ask=*/false);
+    }
+}
+capture.commit_frame();
+HiddenStates states = capture.take();
+```
+
+`examples/04_raw_ggml.cpp` is a runnable version on the CPU backend, no model
+required.
 
 ---
 
 ## API reference
 
+### `Model` — `include/ggml_extractor/model.hpp`
+
+| Member | Description |
+|---|---|
+| `Model::load(path, options)` | load a GGUF, returns `shared_ptr`; initialises backends |
+| `tokenize(text, add_special, parse_special)` | tokenize |
+| `token_to_piece(token)` / `is_eog(token)` | detokenize one token / end-of-generation test |
+| `n_layer()` / `n_embd()` / `n_ctx_train()` / `n_vocab()` | introspection |
+| `architecture()` | `general.architecture`, e.g. `"gemma4"` |
+| `handle()` / `vocab()` | raw llama.cpp handles |
+
+`ModelOptions`: `n_gpu_layers` (`-1` = auto), `required_architecture`
+(empty = any).
+
+### `Session` — `include/ggml_extractor/session.hpp`
+
+| Member | Description |
+|---|---|
+| `Session(model, options)` | create the context (once) and install the callback |
+| `arm(capture)` | `[[nodiscard]]` RAII guard; extraction live while it exists |
+| `armed()` | whether a capture is armed |
+| `decode(seq, tokens, logits_last)` | decode a batch into `seq`, splitting across `n_batch` |
+| `decode_one(seq, token)` | one generation step, with logits |
+| `n_past(seq)` | next position for `seq` (read from the KV cache) |
+| `reset(seq)` / `reset_all()` | free one sequence / all sequences |
+| `sample_greedy()` | argmax over the last logits |
+| `model()` / `handle()` | the shared model / raw context handle |
+| `n_ctx()` / `n_ctx_seq()` / `n_batch()` | sizes as llama.cpp allocated them |
+
+`SessionOptions`: `n_ctx` (default `4096`), `n_batch`, `n_ubatch`,
+`n_seq_max`, `n_threads`, `n_threads_batch`.
+
+### `HiddenStateCapture` — `include/ggml_extractor/capture.hpp`
+
+| Member | Description |
+|---|---|
+| `HiddenStateCapture(requests)` | non-empty; duplicate (tensor, token) pairs rejected |
+| `filter(tensor, ask)` | the callback body (`noexcept`); for raw ggml loops |
+| `begin_frame()` | discard the in-progress frame |
+| `frame_complete()` / `require_frame_complete()` | test / throw with details |
+| `error()` | first error recorded by `filter` |
+| `commit_frame()` | validate, append, and begin the next frame |
+| `frame_count()` / `requests()` / `embedding_width()` | introspection |
+| `take()` | move the committed frames out as `HiddenStates` |
+
+`HiddenStates`: `data`, `n_frames`, `n_requests`, `n_embd`, plus
+`row(frame, request)` and `save_npy(path)`.
+
+### `Multimodal` — `include/ggml_extractor/multimodal.hpp`
+
+| Member | Description |
+|---|---|
+| `Multimodal(model, mmproj_path, options)` | load the projector against a `Model` |
+| `supports_vision()` / `supports_audio()` | projector capabilities |
+| `marker()` | the media placeholder, default `"<__media__>"` |
+| `eval(session, seq, prompt, media_paths, logits_last)` | encode media, decode prompt + media |
+
+`MultimodalOptions`: `use_gpu`, `n_threads`, `print_timings`.
+
 ### `TokenSelector` — `include/ggml_extractor/token_selector.hpp`
 
 | Factory | Meaning |
 |---|---|
-| `TokenSelector::last()` | last row (`offset 0`) — decode |
-| `TokenSelector::second_last()` | `offset 1` |
-| `TokenSelector::third_last()` | `offset 2` |
-| `TokenSelector::from_end(k)` | `k`-th from end (`0` = last) |
-| `TokenSelector::generated()` | current generated token — inference loop |
-
-Accessors: `mode()`, `offset_from_end()`, `is_generated()`, `to_string()`.
-
-### `ExtractionRequest` — `include/ggml_extractor/extraction_request.hpp`
-
-```cpp
-struct ExtractionRequest {
-    std::string tensor_name;             // exact ggml name, e.g. "l_out-20"
-    TokenSelector token = TokenSelector::last();
-};
-```
-
-One tensor may appear multiple times with different selectors.
-
-### `HiddenStateExtractor` — `include/ggml_extractor/extractor.hpp`
-
-Construct with `std::vector<ExtractionRequest>` (non-empty; exact-duplicate
-tensor+token pairs rejected).
-
-| Method | Description |
-|---|---|
-| `attach(params)` | set `cb_eval` + `user_data` on `llama_context_params` |
-| `callback(t, ask, ud)` | static trampoline for `cb_eval` (`noexcept`) |
-| `filter(t, ask)` | instance filter for raw ggml loops (`noexcept`) |
-| `begin_frame()` | reset flags + error before each decode |
-| `frame_complete()` | all requests copied, no error |
-| `require_frame_complete()` | throw with missing-tensor details |
-| `error()` | last callback error |
-| `request_count()` / `request(i)` / `requests()` | introspection |
-| `embedding_width(i)` / `common_embedding_width()` | observed widths |
-| `frame_row(i)` | current frame row for request `i` |
-| `frame_flat()` | concatenated current frame |
-| `commit_frame()` | validate (complete + finite + uniform) and append |
-| `sequence_frame_count()` / `has_sequence()` / `clear_sequence()` | buffer mgmt |
-| `save_npy(path)` | `(frames, requests, embd)` — needs ≥1 commit |
-| `save_current_frame_npy(path)` | `(requests, embd)` — current frame only |
-
-### `LlamaSession` — `include/ggml_extractor/llama_session.hpp`
-
-Owns `llama_model` + `llama_context`; borrows the extractor (must outlive it).
-
-| Method | Description |
-|---|---|
-| `LlamaSession(path, extractor, opts)` | load GGUF; optional arch guard |
-| `tokenize(prompt)` | BOS-aware, special-parsing tokenization |
-| `decode(tokens)` | prefill: size/create ctx, clear KV, decode, `n_past = N` |
-| `decode_one(token)` | generate step: reuse ctx, `pos = n_past`, decode, `n_past++` |
-| `n_layer()` / `n_embd()` / `n_ctx_train()` | model introspection |
-| `context_handle()` / `model_handle()` | raw handles for sampling/logits |
-
-`LlamaSessionOptions`: `n_gpu_layers` (default `-1`), `n_ctx` (`0` = auto;
-set explicitly for generation so the context is not re-created),
-`n_batch` (`0` = `n_ctx`), `required_architecture` (empty = any).
+| `last()` | last row (offset 0) |
+| `second_last()` / `third_last()` | offset 1 / 2 |
+| `from_end(k)` | k-th from end (0 = last) |
+| `generated()` | current generated token — inference loop |
 
 ### `NpyWriter` — `include/ggml_extractor/npy_writer.hpp`
 
-- `NpyWriter(path, shape)` + `write_values(ptr, n)` + `finish()` (streaming).
-- `save_npy(path, values, shape)`, `save_npy_2d`, `save_npy_3d` (one-shot).
-- Refuses to overwrite; atomic publish via temp sibling + hard link.
+Streaming `NpyWriter(path, shape)` + `write_values()` + `finish()`, and
+one-shot `save_npy`, `save_npy_2d`, `save_npy_3d`. Refuses to overwrite;
+publishes atomically.
 
 ---
 
@@ -358,101 +405,121 @@ set explicitly for generation so the context is not re-created),
 
 ### Tensor naming
 
-- `tensor_name` is compared with `std::string_view(tensor->name)` using exact,
-  case-sensitive equality.
-- Typical instrumented llama.cpp names: `inp_scaled` (scaled input embeddings),
-  `l_out-<layer>` (block outputs, `0`-based). Any exact name in the evaluated
-  graph is valid.
-- Non-matching tensors return `false` in the `ask` phase and are ignored.
+- `tensor_name` is compared to `tensor->name` with exact, case-sensitive
+  equality. Requests are grouped by name at construction, so the `ask` phase
+  is one lookup per graph node regardless of how many layers you request.
+- llama.cpp names hidden tensors `inp_scaled` (scaled input embeddings) and
+  `l_out-<layer>` (block outputs, 0-based), unconditionally, in
+  `llama_context::graph_get_cb`. Any exact name in the evaluated graph works.
+- These are internal debug names with **no stability guarantee** across
+  llama.cpp versions. A rename — or a tensor removed by operator fusion —
+  makes `require_frame_complete()` throw rather than return wrong data. Run
+  one prompt at startup to fail fast.
 
 ### Token indexing
 
 - ggml hidden tensors are `(n_embd, n_tokens, 1, 1)`; the token axis is `ne[1]`.
 - Selected row: `source_row = ne[1] - 1 - offset_from_end`.
-- `offset >= ne[1]` → callback error → `require_frame_complete()` throws
-  (e.g. `second_last()` on a 1-token decode).
-- `generated()` ≡ offset 0 of the **current** decode batch. In a generation
-  loop each decode carries exactly the new token, so this is the current
-  generated token's row.
+- **Offsets past the last token need care on long prompts.** A prompt longer
+  than `n_ubatch` is evaluated in several passes, and the capture keeps the
+  most recent one — so `last()` is always the final prompt token, but
+  `from_end(k)` for `k > 0` requires the *last* pass to hold more than `k`
+  rows. When it does not, the capture reports it instead of guessing. Raise
+  `SessionOptions::n_ubatch` past your prompt length if you need those rows.
+
+### The final layer is special
+
+llama.cpp gathers the last block's output down to only the positions you
+requested logits for:
+
+```c
+// llama.cpp, e.g. src/models/gemma3.cpp
+if (il == n_layer - 1 && inp_out_ids) {
+    cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+    inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+}
+```
+
+So `l_out-<n_layer-1>` has `ne[1] == n_outputs`, not the batch length. Two
+consequences:
+
+- **Extracting the final layer requires `logits_last = true`.** With no
+  outputs requested that tensor has zero rows, nothing is captured, and
+  `commit_frame()` throws `missing hidden state`. A zero-row tensor is treated
+  as "no rows in this pass", not as an error, so a multi-batch prompt still
+  works — only the pass carrying the outputs contributes.
+- **`from_end(k)` with `k > 0` is unavailable on the final layer**, since it
+  holds only the output rows. Ask for it on any earlier layer instead.
+
+Every other layer, and `inp_scaled`, carry the full batch.
+
+### Frames
+
+A frame is one row of the output. Several `llama_decode` calls may feed one
+frame — a batched prompt, or an interleaved image + text prompt — with each
+overwriting the last, so a frame committed after a whole prefill holds the
+final prompt token. `commit_frame()` closes the current frame and opens the
+next, which makes a generation loop one commit per sampled token.
 
 ### Shapes
 
-| Output | Shape | Axes |
-|---|---|---|
-| `save_npy` (sequence) | `(F, R, E)` | frames, requests (ctor order), embd |
-| `save_current_frame_npy` | `(R, E)` | requests, embd |
-| Prefill single prompt | `(1, R, E)` | |
-| Batch of `B` prompts | `(B, R, E)` | input order |
-| `G` generated tokens | `(G, R, E)` | generation order |
+| Output | Shape |
+|---|---|
+| `HiddenStates` from a single prefill | `(1, R, E)` |
+| `B` prompts | `(B, R, E)` |
+| `G` generated tokens | `(G, R, E)` |
 
-- `E` must be uniform across requests and frames; otherwise `save_npy` throws.
-- Dtype is always float32 (`<f4`), C-order.
+Axes are (frames, requests in construction order, embedding). `E` must be
+uniform across requests and frames. Dtype is always float32, C-order.
 
 ### `.npy` format
 
-- Version 1.0 (`\x93NUMPY`, `1.0`, uint16 LE header length).
-- Header `{'descr': '<f4', 'fortran_order': False, 'shape': (...), }` padded
-  with spaces + `\n` to 64-byte alignment.
+- Version 1.0 (`\x93NUMPY`, `1.0`, uint16 LE header length), `'<f4'`,
+  `fortran_order: False`, header padded to 64-byte alignment.
 - Little-endian hosts write directly; big-endian hosts byte-swap per float.
-- Requires 8-bit bytes, 32-bit IEEE-754 float (static asserts).
-- Write-then-link: bytes go to `<output>.tmp-<rand>`; `create_hard_link` to
-  the final path fails if the output already exists — existing files are never
-  truncated.
-
-### Lifecycle contract
-
-```
-begin_frame() → llama_decode() → llama_synchronize()
-  → require_frame_complete() → commit_frame() → [repeat] → save_npy()
-```
-
-- Call `begin_frame()` before **every** decode (both `decode` and
-  `decode_one` do this internally — call it manually only for raw ggml loops).
-- `commit_frame()` validates completeness, finiteness (`isfinite`), and width
-  uniformity, then copies.
-- `save_npy()` requires ≥1 committed frame.
+- Write-then-link: bytes go to `<output>.tmp-<rand>`, then `create_hard_link`
+  to the final path — which fails if the output exists. Existing files are
+  never truncated, so a service that writes files should vary the path.
 
 ### Validation performed per tensor
 
-1. `type == GGML_TYPE_F32`, else error.
+1. `type == GGML_TYPE_F32`.
 2. `ne[2] == 1 && ne[3] == 1`, `ne[0] > 0`, `ne[1] > 0`.
 3. Row-major contiguity: `nb[0] == 4`, `nb[1] == ne[0] * 4`.
-4. Overflow-checked `source_offset = source_row * nb[1]`;
-   `source_offset + row_bytes ≤ ggml_nbytes(tensor)`.
+4. Overflow-checked `source_offset`, bounded by `ggml_nbytes(tensor)`.
 5. First-seen width per request is latched; later widths must match.
-6. Copy via `ggml_backend_tensor_get`.
+6. `commit_frame()` additionally rejects non-finite values.
 
-### Context & positions (generation)
+### Threading
 
-- `decode()` clears KV memory and starts positions at 0; afterwards
-  `n_past = N`.
-- `decode_one()` reuses the context, sets `batch.pos[0] = n_past`, decodes,
-  then `n_past++`. KV cache is preserved.
-- If no context exists, `decode_one()` creates one from `options.n_ctx`
-  (or training length) — but prefer an explicit prefill or `n_ctx` so the
-  context is large enough for the full run. Exceeding it throws.
-
-### Threading & determinism
-
-- One extractor per inference stream; concurrent decodes sharing an extractor
-  are not supported.
-- The `cb_eval` path is `noexcept`; errors surface on the decode thread via
+- `Model` is read-only during inference and may back any number of concurrent
+  `Session`s.
+- A `Session` and a `Capture` are single-threaded: one per worker. For a
+  concurrent service, give each worker its own `Session` over the shared
+  `Model`, or serialise behind a mutex.
+- The `cb_eval` path is `noexcept`; errors surface on the decoding thread via
   `require_frame_complete()`.
-- No RNG inside the library (only temp-file suffixes). Seeded-model behavior
-  may still vary by backend (`cpu` is the conservative choice).
+- Backend initialisation happens once per process (`ensure_backend_initialized`,
+  called by `Model::load`) and is never torn down — llama.cpp's backend
+  registry is global state shared by every model and context.
 
 ---
 
 ## Examples
 
-| File | Shows | Output shape |
-|---|---|---|
-| `examples/01_prefill.cpp` | single prompt, `inp_scaled` + layers | `(R, E)` via `save_current_frame_npy`-equivalent sequence of 1 |
-| `examples/02_batch.cpp` | many prompts, same tensor twice (last + 2nd-last) | `(B, R, E)` |
-| `examples/03_generate.cpp` | greedy generation, `generated()` rows | `(G, R, E)` |
-| `examples/04_raw_ggml.cpp` | raw graph loop without `LlamaSession` | `(F, R, E)` |
+| File | Shows |
+|---|---|
+| `examples/01_prefill.cpp` | one prompt, layers chosen on the command line |
+| `examples/02_batch.cpp` | many prompts through one session, `reset(seq)` between |
+| `examples/03_generate.cpp` | greedy generation, one frame per generated token |
+| `examples/04_raw_ggml.cpp` | the two-phase protocol on a raw CPU graph, no model |
+| `examples/05_service.cpp` | **one process: text gen, text extraction, image gen, image extraction** |
 
-See [Usage](#usage) for the corresponding snippets.
+```bash
+./build/service_example -m gemma4.gguf --mmproj mmproj-gemma4.gguf \
+    --image photo.jpg --image-prompt "What is in this picture?" \
+    -p "The capital of Italy is" -n 48 -l 20,29 -o out
+```
 
 ---
 
@@ -461,24 +528,23 @@ See [Usage](#usage) for the corresponding snippets.
 ```
 ggml-extractor/
 ├── assets/
-│   ├── logo.svg              # vector logo
-│   └── logo.png              # raster logo (1024 px)
 ├── examples/
 │   ├── 01_prefill.cpp
 │   ├── 02_batch.cpp
 │   ├── 03_generate.cpp
-│   └── 04_raw_ggml.cpp
+│   ├── 04_raw_ggml.cpp
+│   └── 05_service.cpp
 ├── include/ggml_extractor/
-│   ├── extractor.hpp         # HiddenStateExtractor
+│   ├── backend.hpp           # process-wide backend init
+│   ├── model.hpp             # Model (shared weights)
+│   ├── session.hpp           # Session + SessionOptions + arm()
+│   ├── capture.hpp           # HiddenStateCapture + HiddenStates
+│   ├── multimodal.hpp        # Multimodal (libmtmd)
 │   ├── extraction_request.hpp
 │   ├── token_selector.hpp
-│   ├── llama_session.hpp     # LlamaSession + options
 │   ├── npy_writer.hpp
-│   └── version.hpp           # 0.1.0
+│   └── version.hpp
 ├── src/
-│   ├── extractor.cpp
-│   ├── llama_session.cpp
-│   └── npy_writer.cpp
 ├── CMakeLists.txt
 ├── LICENSE                   # MIT
 └── README.md
@@ -486,22 +552,43 @@ ggml-extractor/
 
 ---
 
+## Upgrading from 0.1.x
+
+`HiddenStateExtractor` and `LlamaSession` are gone; their responsibilities are
+split four ways.
+
+| 0.1.x | 0.2.0 |
+|---|---|
+| `LlamaSession(path, extractor, opts)` | `Model::load(path)` then `Session(model, opts)` |
+| `HiddenStateExtractor(requests)` | `HiddenStateCapture(requests)`, one per request |
+| `extractor.attach(params)` | automatic — `Session` installs its own trampoline |
+| *(no way to turn it off)* | `session.arm(capture)` returns an RAII guard |
+| `session.decode(tokens)` | `session.decode(seq, tokens, logits_last)` |
+| `session.decode_one(token)` | `session.decode_one(seq, token)` |
+| `extractor.require_frame_complete(); extractor.commit_frame();` | `capture.commit_frame()` (it validates first) |
+| `extractor.save_npy(path)` | `capture.take()` → `HiddenStates`, then `save_npy(path)` if you want a file |
+| `extractor.clear_sequence()` | `capture.take()` (or drop the capture) |
+
+Behavioural changes worth knowing:
+
+- **The KV cache is no longer cleared on every prefill.** `decode()` continues
+  from the sequence's current position; call `reset(seq)` for an independent
+  prompt.
+- **The context is never recreated.** Size it with `SessionOptions::n_ctx` at
+  construction; 0.1.x re-created it whenever a longer prompt arrived.
+- **Results come back in memory.** `.npy` output is optional.
+- **`llama_backend_init` is process-global**, not per session, so several
+  sessions can coexist.
+
+---
+
 ## Provenance
 
 Generalizes the extraction logic previously embedded in
-`concept-embeddings`' `cpp/hidden_states/src/main.cpp` (full
-`inp_scaled` + all-layer prefill capture) and `query_main.cpp` (selected-layer
-query capture with `l_out-{20,25,26,29,35}`). Behavior preserved:
-
-- two-phase `cb_eval` (`ask` → copy),
-- last-row (`ne[1]-1-offset`) float32 contiguous copies via
-  `ggml_backend_tensor_get`,
-- atomic non-overwriting `.npy` output.
-
-What changed: hard-coded layer lists → user-supplied `ExtractionRequest`
-vectors; `main.cpp`-specific CSV/model runners → reusable
-`HiddenStateExtractor` + `LlamaSession`; generation support with position
-tracking.
+`concept-embeddings`' `cpp/hidden_states/src/main.cpp` and `query_main.cpp`.
+Preserved from those tools and from 0.1.x: two-phase `cb_eval` (`ask` → copy),
+last-row (`ne[1]-1-offset`) float32 contiguous copies via
+`ggml_backend_tensor_get`, and atomic non-overwriting `.npy` output.
 
 ---
 
@@ -519,8 +606,3 @@ Copyright (c) 2026 Giulio Enzo Donninelli and Adversal.ai
 
 - **Giulio Enzo Donninelli** — design, implementation.
 - **[Adversal.ai](https://adversal.ai)** — supporting company.
-
-Logo: `assets/logo.svg` / `assets/logo.png` (this page, top).
-
-If you use this library, a citation or shout-out is appreciated but not
-required by the license.

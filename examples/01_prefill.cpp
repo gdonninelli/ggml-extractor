@@ -1,77 +1,107 @@
-// 01_prefill.cpp — minimal prefill extraction: one prompt, N tensors, last token.
+// 01_prefill.cpp — extract hidden states for one prompt.
 //
-// Build (after configuring with -DLLAMA_CPP_DIR=<path to llama.cpp>):
-//   cmake --build build --target prefill_example
+// The minimal shape of the API: load the model, open a session, arm a capture
+// for the prefill, commit one frame, take the result.
+//
+// Output shape: (1, n_requests, n_embd).
+//
 // Run:
 //   ./build/prefill_example -m model.gguf -p "hello world" -o out.npy
-//
-// Output shape: (n_requests, n_embd) — one row per ExtractionRequest.
+//   ./build/prefill_example -m model.gguf -p "hello world" -o out.npy -l 20,25,29
 
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "ggml_extractor/extractor.hpp"
-#include "ggml_extractor/llama_session.hpp"
+#include "ggml_extractor/capture.hpp"
+#include "ggml_extractor/model.hpp"
+#include "ggml_extractor/session.hpp"
 #include "ggml_extractor/token_selector.hpp"
+
+using namespace ggml_extractor;
 
 namespace {
 
-void usage(const char* prog) {
-    std::cout << "Usage: " << prog << " -m <model.gguf> -p <prompt> -o <out.npy>\n";
+std::vector<int> parse_layers(const std::string& csv) {
+    std::vector<int> layers;
+    std::size_t start = 0;
+    while (start <= csv.size()) {
+        const std::size_t comma = csv.find(',', start);
+        const std::string item = csv.substr(start, comma - start);
+        if (!item.empty()) {
+            layers.push_back(std::stoi(item));
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return layers;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, prompt, output;
+    std::string model_path, prompt, output, layer_csv = "20";
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        auto need_value = [&](const std::string& opt) -> std::string {
+        auto value = [&](const char* opt) -> std::string {
             if (++i >= argc) {
-                throw std::runtime_error("missing value for " + opt);
+                throw std::runtime_error(std::string("missing value for ") + opt);
             }
             return argv[i];
         };
         if (arg == "-m") {
-            model = need_value(arg);
+            model_path = value("-m");
         } else if (arg == "-p") {
-            prompt = need_value(arg);
+            prompt = value("-p");
         } else if (arg == "-o") {
-            output = need_value(arg);
-        } else if (arg == "-h" || arg == "--help") {
-            usage(argv[0]);
-            return 0;
+            output = value("-o");
+        } else if (arg == "-l") {
+            layer_csv = value("-l");
         } else {
-            throw std::runtime_error("unknown option: " + arg);
+            std::cout << "Usage: " << argv[0]
+                      << " -m <model.gguf> -p <prompt> -o <out.npy> [-l 20,25,29]\n";
+            return arg == "-h" || arg == "--help" ? 0 : 1;
         }
     }
-    if (model.empty() || prompt.empty() || output.empty()) {
-        usage(argv[0]);
+    if (model_path.empty() || prompt.empty() || output.empty()) {
+        std::cerr << "Usage: " << argv[0]
+                  << " -m <model.gguf> -p <prompt> -o <out.npy> [-l 20,25,29]\n";
         return 1;
     }
 
     try {
-        // 1. Declare WHAT to capture: exact ggml tensor names + token rows.
-        ggml_extractor::HiddenStateExtractor extractor({
-            {"inp_scaled", ggml_extractor::TokenSelector::last()},
-            {"l_out-20", ggml_extractor::TokenSelector::last()},
-            {"l_out-25", ggml_extractor::TokenSelector::last()},
-        });
+        auto model = Model::load(model_path);
+        Session session(model, SessionOptions{});
 
-        // 2. Open the model; the session attaches the extractor to llama.cpp.
-        ggml_extractor::LlamaSession session(model, extractor);
+        // WHAT to capture — chosen per capture, not per session.
+        std::vector<ExtractionRequest> requests{
+            {"inp_scaled", TokenSelector::last()},
+        };
+        for (const int layer : parse_layers(layer_csv)) {
+            requests.push_back({"l_out-" + std::to_string(layer), TokenSelector::last()});
+        }
+        HiddenStateCapture capture(std::move(requests));
 
-        // 3. Prefill decode. The extractor copies each requested row.
-        session.decode(session.tokenize(prompt));
-        extractor.require_frame_complete();
-        extractor.commit_frame();
+        {
+            auto armed = session.arm(capture);
+            // Logits are requested so the final layer is reachable: llama.cpp
+            // gathers l_out-<n_layer-1> down to the output positions.
+            session.decode(0, model->tokenize(prompt), /*logits_last=*/true);
+            capture.commit_frame();
+        }  // disarmed here — the session is back to full-speed inference
 
-        // 4. Persist: shape (3, n_embd).
-        extractor.save_npy(output);
-        std::cout << "wrote " << output << " shape=(3, " << extractor.common_embedding_width()
-                  << ")\n";
+        const HiddenStates states = capture.take();
+        states.save_npy(output);
+        std::cout << "wrote " << output << " shape=(" << states.n_frames << ", "
+                  << states.n_requests << ", " << states.n_embd << ")\n";
+        for (std::size_t i = 0; i < capture.requests().size(); ++i) {
+            std::cout << "  [" << i << "] " << capture.requests()[i].tensor_name << " token="
+                      << capture.requests()[i].token.to_string()
+                      << " first=" << states.row(0, i)[0] << "\n";
+        }
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "error: " << ex.what() << "\n";

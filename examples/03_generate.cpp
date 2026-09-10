@@ -1,125 +1,119 @@
-// 03_generate.cpp — autoregressive generation: capture the CURRENT generated
-// token at every step (greedy argmax over logits, no sampler dependency).
+// 03_generate.cpp — capture the hidden state of every generated token.
 //
-//   1. prefill the prompt,
-//   2. greedy-sample the next token from the last logits,
-//   3. decode_one(token) per step — the extractor copies the GENERATED row,
-//   4. commit one frame per generated token.
+// The prefill frame is dropped with begin_frame(); after that each
+// decode_one + commit_frame pair contributes one frame, so the output rows
+// line up with the generated tokens.
 //
 // Output shape: (n_generated, n_requests, n_embd).
 //
 // Run:
-//   ./build/generate_example -m model.gguf -p "The capital of Italy is" \
-//       -o gen.npy -n 32
+//   ./build/generate_example -m model.gguf -p "Rome is" -o gen.npy -n 32
 
 #include <iostream>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "ggml_extractor/extractor.hpp"
-#include "ggml_extractor/llama_session.hpp"
+#include "ggml_extractor/capture.hpp"
+#include "ggml_extractor/model.hpp"
+#include "ggml_extractor/session.hpp"
 #include "ggml_extractor/token_selector.hpp"
-#include "llama.h"
+
+using namespace ggml_extractor;
 
 namespace {
 
-int32_t greedy_next(llama_context* ctx, const llama_vocab* vocab) {
-    float* logits = llama_get_logits(ctx);
-    if (logits == nullptr) {
-        throw std::runtime_error("llama_get_logits returned null (enable logits?)");
-    }
-    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-    if (n_vocab <= 0) {
-        throw std::runtime_error("invalid vocabulary size");
-    }
-    int32_t best = 0;
-    float best_logit = logits[0];
-    for (int32_t i = 1; i < n_vocab; ++i) {
-        if (logits[i] > best_logit) {
-            best_logit = logits[i];
-            best = i;
+std::vector<int> parse_layers(const std::string& csv) {
+    std::vector<int> layers;
+    std::size_t start = 0;
+    while (start <= csv.size()) {
+        const std::size_t comma = csv.find(',', start);
+        const std::string item = csv.substr(start, comma - start);
+        if (!item.empty()) {
+            layers.push_back(std::stoi(item));
         }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
     }
-    return best;
+    if (layers.empty()) {
+        throw std::runtime_error("no layers requested");
+    }
+    return layers;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, prompt, output;
+    std::string model_path, prompt, output, layer_csv = "20";
     int n_predict = 32;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        auto need_value = [&](const char* opt) -> std::string {
+        auto value = [&](const char* opt) -> std::string {
             if (++i >= argc) {
                 throw std::runtime_error(std::string("missing value for ") + opt);
             }
             return argv[i];
         };
         if (arg == "-m") {
-            model = need_value("-m");
+            model_path = value("-m");
         } else if (arg == "-p") {
-            prompt = need_value("-p");
+            prompt = value("-p");
         } else if (arg == "-o") {
-            output = need_value("-o");
+            output = value("-o");
         } else if (arg == "-n") {
-            n_predict = std::stoi(need_value("-n"));
-        } else if (arg == "-h" || arg == "--help") {
-            std::cout << "Usage: " << argv[0]
-                      << " -m <model.gguf> -p <prompt> -o <out.npy> [-n <tokens>]\n";
-            return 0;
+            n_predict = std::stoi(value("-n"));
+        } else if (arg == "-l") {
+            layer_csv = value("-l");
         } else {
-            throw std::runtime_error("unknown option: " + arg);
+            std::cout << "Usage: " << argv[0]
+                      << " -m <model.gguf> -p <prompt> -o <out.npy> [-n <tokens>]"
+                         " [-l 20,25]\n";
+            return arg == "-h" || arg == "--help" ? 0 : 1;
         }
     }
-    if (model.empty() || prompt.empty() || output.empty() || n_predict <= 0) {
+    if (model_path.empty() || prompt.empty() || output.empty() || n_predict <= 0) {
         std::cerr << "Usage: " << argv[0]
-                  << " -m <model.gguf> -p <prompt> -o <out.npy> [-n <tokens>]\n";
+                  << " -m <model.gguf> -p <prompt> -o <out.npy> [-n <tokens>]"
+                     " [-l 20,25]\n";
         return 1;
     }
 
     try {
-        ggml_extractor::HiddenStateExtractor extractor({
-            {"l_out-20", ggml_extractor::TokenSelector::generated()},
-            {"l_out-29", ggml_extractor::TokenSelector::generated()},
-        });
+        auto model = Model::load(model_path);
+        SessionOptions options;
+        options.n_ctx = 4096;
+        Session session(model, options);
 
-        ggml_extractor::LlamaSessionOptions opts;
-        opts.n_ctx = 4096;  // fixed context so the KV cache survives across steps
-        ggml_extractor::LlamaSession session(model, extractor, opts);
+        std::vector<ExtractionRequest> requests;
+        for (const int layer : parse_layers(layer_csv)) {
+            requests.push_back(
+                {"l_out-" + std::to_string(layer), TokenSelector::generated()});
+        }
+        HiddenStateCapture capture(std::move(requests));
 
-        // Prefill. Its frame is intentionally dropped: we only accumulate
-        // GENERATED frames below. Position tracking inside the session
-        // continues from the prompt length.
-        session.decode(session.tokenize(prompt));
-        extractor.require_frame_complete();
-        extractor.begin_frame();  // discard prefill capture, keep KV + position
+        auto armed = session.arm(capture);
 
-        const llama_vocab* vocab = llama_model_get_vocab(session.model_handle());
-        const llama_token eos = llama_vocab_eos(vocab);
+        session.decode(0, model->tokenize(prompt));
+        capture.begin_frame();  // drop the prefill frame, keep the KV cache
 
-        std::vector<int32_t> generated;
-        generated.reserve(static_cast<std::size_t>(n_predict));
+        std::string text;
         for (int step = 0; step < n_predict; ++step) {
-            const int32_t next = greedy_next(session.context_handle(), vocab);
-            generated.push_back(next);
-
-            session.decode_one(next);  // captures the GENERATED row
-            extractor.require_frame_complete();
-            extractor.commit_frame();  // one frame per generated token
-
-            if (next == eos) {
+            const int32_t next = session.sample_greedy();
+            if (model->is_eog(next)) {
                 break;
             }
+            session.decode_one(0, next);
+            capture.commit_frame();  // one frame per generated token
+            text += model->token_to_piece(next);
         }
 
-        extractor.save_npy(output);
-        std::cout << "generated " << generated.size() << " token(s); wrote " << output
-                  << " shape=(" << extractor.sequence_frame_count() << ", "
-                  << extractor.request_count() << ", "
-                  << extractor.common_embedding_width() << ")\n";
+        const HiddenStates states = capture.take();
+        states.save_npy(output);
+        std::cout << "generated: " << text << "\n";
+        std::cout << "wrote " << output << " shape=(" << states.n_frames << ", "
+                  << states.n_requests << ", " << states.n_embd << ")\n";
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "error: " << ex.what() << "\n";
