@@ -25,8 +25,6 @@
 //       --image photo.jpg --image-prompt "What is in this picture?"
 //       -p "The capital of Italy is" -n 48 -l 20,29 -o out
 
-#include "llama.h"
-
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
@@ -34,8 +32,11 @@
 #include <vector>
 
 #include "ggml_extractor/capture.hpp"
+#include "ggml_extractor/chat.hpp"
 #include "ggml_extractor/model.hpp"
 #include "ggml_extractor/session.hpp"
+#include "ggml_extractor/speculative.hpp"
+#include "ggml_extractor/thinking_budget.hpp"
 #include "ggml_extractor/token_selector.hpp"
 
 #ifdef GGML_EXTRACTOR_MULTIMODAL
@@ -59,6 +60,8 @@ struct Args {
     std::string layer_csv = "20";
     int n_predict = 32;
     uint32_t n_ctx = 4096;
+    int thinking_budget = -1;  // -1 = unlimited
+    std::string draft_path;    // empty = skip the draft stage
     bool help = false;
 };
 
@@ -70,6 +73,8 @@ void print_usage(const char* program) {
         << "  -l <a,b,c>           layers to capture, e.g. 20,29 (default 20)\n"
         << "  -n <count>           tokens to generate (default 32)\n"
         << "  -c <count>           context size (default 4096)\n"
+        << "  --thinking-budget N  max thinking tokens per answer (-1 = unlimited)\n"
+        << "  --draft <path>       MTP head file, enables the draft stage\n"
         << "  -o <prefix>          write <prefix>-text.npy / <prefix>-image.npy\n"
 #ifdef GGML_EXTRACTOR_MULTIMODAL
         << "  --mmproj <path>      vision projector, enables stages 3 and 4\n"
@@ -117,52 +122,22 @@ std::vector<ExtractionRequest> build_requests(const std::vector<int>& layers,
 /// Wrap a user turn in the model's chat format, so the demo produces sensible
 /// completions instead of raw text continuation.
 ///
-/// llama_chat_apply_template() is not a Jinja engine — it pattern-matches a
-/// fixed list of known templates and returns -1 for anything else. Gemma 4
-/// ships an 18 KB Jinja template with macros, so it lands in that -1 case and
-/// we emit Gemma's turn markers ourselves. Production code that must handle
-/// arbitrary models wants a real Jinja renderer (llama.cpp's
-/// common_chat_templates, which this project does not build).
+/// Rendered with the model's own Jinja template. Models without one fall
+/// back to the raw prompt.
 std::string as_chat_turn(const Model& model, const std::string& content) {
-    const char* tmpl = llama_model_chat_template(model.handle(), nullptr);
-    if (tmpl != nullptr) {
-        llama_chat_message message{"user", content.c_str()};
-        std::vector<char> buffer(content.size() * 2 + 1024);
-        int32_t written = llama_chat_apply_template(tmpl, &message, 1, /*add_ass=*/true,
-                                                    buffer.data(),
-                                                    static_cast<int32_t>(buffer.size()));
-        if (written > static_cast<int32_t>(buffer.size())) {
-            buffer.resize(static_cast<std::size_t>(written));
-            written = llama_chat_apply_template(tmpl, &message, 1, /*add_ass=*/true,
-                                                buffer.data(),
-                                                static_cast<int32_t>(buffer.size()));
-        }
-        if (written > 0) {
-            return std::string(buffer.data(), static_cast<std::size_t>(written));
-        }
+    try {
+        ChatFormat format(model);
+        return format.render({{"user", content}});
+    } catch (const std::runtime_error&) {
+        return content;
     }
-    // Hand-rolled fallbacks. The markers are control tokens, so the prompt
-    // must be tokenized with parse_special = true; BOS comes from the
-    // tokenizer's add_special.
-    const std::string architecture = model.architecture();
-    if (architecture.rfind("gemma4", 0) == 0) {
-        // Gemma 4 replaced Gemma 2/3's <start_of_turn>/<end_of_turn> with
-        // <|turn>...<turn|> (<turn|> is EOS), and added reasoning channels.
-        // Closing an empty thought channel is how the model's own template
-        // suppresses reasoning, so the answer arrives directly.
-        return "<|turn>user\n" + content +
-               "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
-    }
-    if (architecture.rfind("gemma", 0) == 0) {
-        return "<start_of_turn>user\n" + content +
-               "<end_of_turn>\n<start_of_turn>model\n";
-    }
-    return content;
 }
 
 /// Greedy continuation from whatever is already in `seq`.
-std::string generate(Session& session, int32_t seq, int n_predict) {
+std::string generate(Session& session, int32_t seq, int n_predict,
+                     const ThinkingBudgetOptions& budget_options) {
     const Model& model = session.model();
+    ThinkingBudget budget(budget_options);
     std::string text;
     for (int step = 0; step < n_predict; ++step) {
         const int32_t next = session.sample_greedy();
@@ -170,7 +145,14 @@ std::string generate(Session& session, int32_t seq, int n_predict) {
             break;
         }
         session.decode_one(seq, next);
-        text += model.token_to_piece(next);
+        const std::string piece = model.token_to_piece(next);
+        text += piece;
+        if (budget.observe(piece)) {
+            session.decode(seq, model.tokenize(budget_options.close_marker,
+                                               /*add_special=*/false,
+                                               /*parse_special=*/true));
+            budget.injected();
+        }
     }
     return text;
 }
@@ -224,6 +206,10 @@ Args parse_args(int argc, char** argv) {
             args.n_predict = std::stoi(value("-n"));
         } else if (arg == "-c") {
             args.n_ctx = static_cast<uint32_t>(std::stoul(value("-c")));
+        } else if (arg == "--thinking-budget") {
+            args.thinking_budget = std::stoi(value("--thinking-budget"));
+        } else if (arg == "--draft") {
+            args.draft_path = value("--draft");
         } else if (arg == "-h" || arg == "--help") {
             args.help = true;
             return args;
@@ -260,6 +246,8 @@ int main(int argc, char** argv) {
         }
         const std::vector<int> layers = parse_layers(args.layer_csv);
         const int32_t seq = 0;
+        ThinkingBudgetOptions budget_options;
+        budget_options.max_tokens = args.thinking_budget;
 
         // ---- loaded once, for the whole process lifetime ----------------
         const Clock::time_point load_start = Clock::now();
@@ -271,6 +259,17 @@ int main(int argc, char** argv) {
                   << "  arch=" << model->architecture() << " n_layer=" << model->n_layer()
                   << " n_embd=" << model->n_embd() << " n_ctx=" << session.n_ctx()
                   << " (loaded in " << elapsed_ms(load_start) << " ms)\n";
+
+        // The draft is built before any prefill: switching it on enables the
+        // extra model outputs its first round is primed from.
+        std::unique_ptr<Speculative> draft;
+        if (!args.draft_path.empty()) {
+            draft.reset(new Speculative(session, args.draft_path));
+            std::cout << "  draft=" << args.draft_path
+                      << " mtp_layers=" << draft->n_mtp_layers() << "\n";
+        }
+        std::string stage1_answer;
+        int64_t stage1_ms = 0;
 
 #ifdef GGML_EXTRACTOR_MULTIMODAL
         std::unique_ptr<Multimodal> vision;
@@ -293,9 +292,11 @@ int main(int argc, char** argv) {
             const Clock::time_point start = Clock::now();
             session.reset(seq);
             session.decode(seq, model->tokenize(as_chat_turn(*model, args.text_prompt)));
-            const std::string answer = generate(session, seq, args.n_predict);
+            const std::string answer = generate(session, seq, args.n_predict, budget_options);
+            stage1_answer = answer;
+            stage1_ms = elapsed_ms(start);
             std::cout << "  armed=" << (session.armed() ? "yes" : "no") << " tokens="
-                      << session.n_past(seq) << " in " << elapsed_ms(start) << " ms\n"
+                      << session.n_past(seq) << " in " << stage1_ms << " ms\n"
                       << "  answer: " << answer << "\n";
         }
 
@@ -319,6 +320,41 @@ int main(int argc, char** argv) {
                    args.output_prefix.empty() ? "" : args.output_prefix + "-text.npy");
         }
 
+        // ---- stage 5: draft generation, must match stage 1 ---------------
+        // (before the image stages: it needs no projector)
+        if (draft) {
+            std::cout << "\n[5] draft generation (must match stage 1)\n";
+            {
+                // The guard: drafting with a capture armed must refuse.
+                HiddenStateCapture guard_check(
+                    build_requests(layers, TokenSelector::last()));
+                auto armed = session.arm(guard_check);
+                std::string ignored;
+                try {
+                    draft->generate(seq, 4, ignored);
+                    throw std::runtime_error("draft ran while armed (guard missing)");
+                } catch (const std::runtime_error& ex) {
+                    std::cout << "  armed guard ok: " << ex.what() << "\n";
+                }
+            }
+            const Clock::time_point start = Clock::now();
+            session.reset(seq);
+            session.decode(seq, model->tokenize(as_chat_turn(*model, args.text_prompt)));
+            std::string answer;
+            const int produced = draft->generate(seq, args.n_predict, answer);
+            const int64_t ms = elapsed_ms(start);
+            std::cout << "  tokens=" << session.n_past(seq) << " in " << ms << " ms"
+                      << " (stage 1: " << stage1_ms << " ms)"
+                      << " acceptance=" << draft->acceptance_rate()
+                      << " (" << draft->matched() << "/" << draft->drafted() << ")\n"
+                      << "  answer: " << answer << "\n";
+            if (answer != stage1_answer) {
+                throw std::runtime_error("draft output differs from sequential output");
+            }
+            std::cout << "  match: draft produced " << produced
+                      << " tokens identical to stage 1\n";
+        }
+
 #ifdef GGML_EXTRACTOR_MULTIMODAL
         if (!vision) {
             std::cout << "\npass --mmproj and --image to run the image stages.\n";
@@ -329,14 +365,34 @@ int main(int argc, char** argv) {
         std::cout << "\n[3] image generation (extraction off)\n";
         const std::string media_prompt =
             as_chat_turn(*model, vision->marker() + "\n" + args.image_prompt);
+        std::string stage3_answer;
         {
             const Clock::time_point start = Clock::now();
             session.reset(seq);
             vision->eval(session, seq, media_prompt, {args.image_path});
-            const std::string answer = generate(session, seq, args.n_predict);
+            const std::string answer = generate(session, seq, args.n_predict, budget_options);
+            stage3_answer = answer;
             std::cout << "  image=" << args.image_path << " tokens="
                       << session.n_past(seq) << " in " << elapsed_ms(start) << " ms\n"
                       << "  answer: " << answer << "\n";
+        }
+
+        // ---- stage 3b: same image prompt through the draft ---------------
+        if (draft) {
+            std::cout << "\n[3b] image generation via draft (must match stage 3)\n";
+            const Clock::time_point start = Clock::now();
+            session.reset(seq);
+            vision->eval(session, seq, media_prompt, {args.image_path});
+            std::string answer;
+            draft->generate(seq, args.n_predict, answer);
+            std::cout << "  tokens=" << session.n_past(seq) << " in "
+                      << elapsed_ms(start) << " ms"
+                      << " acceptance=" << draft->acceptance_rate() << "\n"
+                      << "  answer: " << answer << "\n";
+            if (answer != stage3_answer) {
+                throw std::runtime_error("draft image output differs from sequential output");
+            }
+            std::cout << "  match: image draft output identical to stage 3\n";
         }
 
         // ---- stage 4: hidden states for the same image prompt ----------

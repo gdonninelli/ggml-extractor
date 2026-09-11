@@ -227,6 +227,10 @@ uint32_t Session::n_ctx_seq() const {
     return impl_->n_ctx_seq;
 }
 
+uint32_t Session::n_seq_max() const {
+    return impl_->n_seq_max;
+}
+
 uint32_t Session::n_batch() const {
     return impl_->n_batch;
 }

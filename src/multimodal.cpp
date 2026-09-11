@@ -35,6 +35,8 @@ Multimodal::Multimodal(std::shared_ptr<Model> model, const std::string& mmproj_p
     params.use_gpu = options.use_gpu;
     params.print_timings = options.print_timings;
     params.n_threads = options.n_threads;
+    params.image_min_tokens = options.image_min_tokens;
+    params.image_max_tokens = options.image_max_tokens;
 
     impl_->mctx = mtmd_init_from_file(mmproj_path.c_str(), impl_->model->handle(), params);
     if (impl_->mctx == nullptr) {
@@ -62,8 +64,7 @@ void Multimodal::eval(Session& session, int32_t seq, const std::string& prompt,
     mtmd::bitmaps bitmaps;
     for (const std::string& path : media_paths) {
         mtmd_helper_bitmap_wrapper loaded = mtmd_helper_bitmap_init_from_file(
-            impl_->mctx, path.c_str(), /*placeholder=*/false,
-            mtmd_helper_init_opt_default());
+            impl_->mctx, path.c_str(), /*placeholder=*/false);
         if (loaded.video_ctx != nullptr) {
             mtmd_helper_video_free(loaded.video_ctx);
             if (loaded.bitmap != nullptr) {

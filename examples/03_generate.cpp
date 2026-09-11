@@ -16,6 +16,7 @@
 
 #include "ggml_extractor/capture.hpp"
 #include "ggml_extractor/model.hpp"
+#include "ggml_extractor/sampler.hpp"
 #include "ggml_extractor/session.hpp"
 #include "ggml_extractor/token_selector.hpp"
 
@@ -48,6 +49,8 @@ std::vector<int> parse_layers(const std::string& csv) {
 int main(int argc, char** argv) {
     std::string model_path, prompt, output, layer_csv = "20";
     int n_predict = 32;
+    SamplerOptions sampling;
+    sampling.temp = 0.0f;  // greedy by default, so runs stay deterministic
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto value = [&](const char* opt) -> std::string {
@@ -66,17 +69,27 @@ int main(int argc, char** argv) {
             n_predict = std::stoi(value("-n"));
         } else if (arg == "-l") {
             layer_csv = value("-l");
+        } else if (arg == "--top-k") {
+            sampling.top_k = std::stoi(value("--top-k"));
+        } else if (arg == "--top-p") {
+            sampling.top_p = std::stof(value("--top-p"));
+        } else if (arg == "--temp") {
+            sampling.temp = std::stof(value("--temp"));
+        } else if (arg == "--seed") {
+            sampling.seed = static_cast<uint32_t>(std::stoul(value("--seed")));
         } else {
-            std::cout << "Usage: " << argv[0]
-                      << " -m <model.gguf> -p <prompt> -o <out.npy> [-n <tokens>]"
-                         " [-l 20,25]\n";
+        std::cout << "Usage: " << argv[0]
+                  << " -m <model.gguf> -p <prompt> -o <out.npy> [-n <tokens>]"
+                     " [-l 20,25] [--top-k 40] [--top-p 0.95] [--temp 0.8]"
+                     " [--seed 42]\n";
             return arg == "-h" || arg == "--help" ? 0 : 1;
         }
     }
     if (model_path.empty() || prompt.empty() || output.empty() || n_predict <= 0) {
         std::cerr << "Usage: " << argv[0]
                   << " -m <model.gguf> -p <prompt> -o <out.npy> [-n <tokens>]"
-                     " [-l 20,25]\n";
+                     " [-l 20,25] [--top-k 40] [--top-p 0.95] [--temp 0.8]"
+                     " [--seed 42]\n";
         return 1;
     }
 
@@ -92,6 +105,7 @@ int main(int argc, char** argv) {
                 {"l_out-" + std::to_string(layer), TokenSelector::generated()});
         }
         HiddenStateCapture capture(std::move(requests));
+        Sampler sampler(sampling);
 
         auto armed = session.arm(capture);
 
@@ -100,7 +114,7 @@ int main(int argc, char** argv) {
 
         std::string text;
         for (int step = 0; step < n_predict; ++step) {
-            const int32_t next = session.sample_greedy();
+            const int32_t next = sampler.sample(session);
             if (model->is_eog(next)) {
                 break;
             }

@@ -146,6 +146,8 @@ public:
     uint32_t n_ctx() const;
     /// @brief Per-sequence context size.
     uint32_t n_ctx_seq() const;
+    /// @brief Independent sequences (conversation slots) the context holds.
+    uint32_t n_seq_max() const;
     /// @brief Logical batch size.
     uint32_t n_batch() const;
 

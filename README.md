@@ -61,6 +61,7 @@ HiddenStates states = capture.take();             // (1, 3, n_embd), in memory
 - [API reference](#api-reference)
 - [Specification](#specification)
 - [Examples](#examples)
+- [Serving (llama-server equivalent)](#serving-llama-server-equivalent)
 - [Project layout](#project-layout)
 - [Upgrading from 0.1.x](#upgrading-from-01x)
 - [License](#license)
@@ -141,7 +142,7 @@ and re-prefilling every prompt. One context is the better trade.
 | GGUF model | Any architecture (optional `required_architecture` guard) |
 | `mmproj` GGUF | Only for image/audio input — a separate file, see below |
 
-Verified against llama.cpp `df03399` (2026-09-10).
+Verified against llama.cpp `5ecbe1ac1` (2026-08-18).
 
 ---
 
@@ -168,7 +169,7 @@ cmake --build build -j
 | `LLAMA_CPP_DIR` | *(required)* | llama.cpp source checkout |
 | `GGML_EXTRACTOR_MULTIMODAL` | `ON` | Build `libmtmd` and `Multimodal`. Turn it `OFF` for text-only models: `libmtmd` is a large library (every vision/audio architecture llama.cpp supports) and is useless without a projector file. |
 
-All five examples build in either configuration —
+All six examples build in either configuration —
 `service_example`'s image stages are `#ifdef`-guarded on the
 `GGML_EXTRACTOR_MULTIMODAL` define the library exports.
 
@@ -357,6 +358,62 @@ required.
 `SessionOptions`: `n_ctx` (default `4096`), `n_batch`, `n_ubatch`,
 `n_seq_max`, `n_threads`, `n_threads_batch`.
 
+### `Sampler` — `include/ggml_extractor/sampler.hpp`
+
+| Member | Description |
+|---|---|
+| `Sampler(options)` | top-k → top-p → temperature → draw chain over a session's logits |
+| `sample(session)` | draw one token; throws when the last decode skipped logits |
+
+`SamplerOptions`: `top_k` (default `40`, `<= 0` = off), `top_p` (default
+`0.95`, `>= 1` = off), `temp` (default `0.8`, `<= 0` = greedy),
+`seed` (default random). One `Sampler` per worker thread.
+
+### `ChatFormat` — `include/ggml_extractor/chat.hpp`
+
+| Member | Description |
+|---|---|
+| `ChatFormat(model, template_override)` | parse the model's Jinja template once (override optional) |
+| `render(messages, options)` | prompt string for `Model::tokenize`; strips a template BOS the tokenizer re-adds |
+| `source()` | the template text in use |
+
+`ChatOptions`: `add_generation_prompt` (default `true`), `enable_thinking`
+(default `true`; unknown to older templates). Text-only messages; tool calls
+are not supported. Renders with llama.cpp's own Jinja engine, compiled from
+`common/jinja` in the checkout — no `common/` build needed.
+
+### `ThinkingBudget` — `include/ggml_extractor/thinking_budget.hpp`
+
+| Member | Description |
+|---|---|
+| `ThinkingBudget(options)` | watches generated text, fires once past the budget |
+| `observe(piece)` | feed one token's text; true = decode the close marker now |
+| `injected()` / `reset()` | call after injecting / for a new answer |
+| `active()` / `thinking_tokens()` | inside a thought block / tokens counted |
+
+`ThinkingBudgetOptions`: `max_tokens` (default `-1` = unlimited, `0` =
+no thinking), `open_marker` / `close_marker` (defaults fit Gemma 4's
+thought channel). Injection is an ordinary decode, safe under an armed
+capture. Applies to sequential generation only — draft rounds are greedy
+and unbounded by design. One per generation loop; single-threaded like
+the rest.
+
+### `Speculative` — `include/ggml_extractor/speculative.hpp`
+
+| Member | Description |
+|---|---|
+| `Speculative(session, draft_path, options)` | load an MTP head file, share the session's memory; enables extra model outputs, so build before the prefill |
+| `generate(seq, n_predict, out)` | greedy generation in draft-and-check rounds; bit-identical to sequential greedy, throws while armed |
+| `n_mtp_layers()` / `drafted()` / `matched()` / `acceptance_rate()` | head count / proposed / kept / kept ÷ proposed (`-1` when idle) |
+
+`SpeculativeOptions`: `n_drafts` (default `3`; a round verifies
+`n_drafts + 1` tokens, must fit `n_batch`), `n_gpu_layers` (default `-1`).
+Only shared-memory MTP heads (Gemma-style) are supported; anything else
+throws at construction. Draft rounds pick greedily — for top-k/top-p
+output, generate sequentially with `Sampler`. One sequence per call; the
+session must outlive the object. Uses llama.cpp's staging `llama-ext.h`
+(MTP support, pinned checkout only).
+
 ### `HiddenStateCapture` — `include/ggml_extractor/capture.hpp`
 
 | Member | Description |
@@ -382,7 +439,9 @@ required.
 | `marker()` | the media placeholder, default `"<__media__>"` |
 | `eval(session, seq, prompt, media_paths, logits_last)` | encode media, decode prompt + media |
 
-`MultimodalOptions`: `use_gpu`, `n_threads`, `print_timings`.
+`MultimodalOptions`: `use_gpu`, `n_threads`, `print_timings`,
+`image_min_tokens` / `image_max_tokens` (default `-1` = from the projector
+file; only models with dynamic resolution use them).
 
 ### `TokenSelector` — `include/ggml_extractor/token_selector.hpp`
 
@@ -496,7 +555,14 @@ uniform across requests and frames. Dtype is always float32, C-order.
   `Session`s.
 - A `Session` and a `Capture` are single-threaded: one per worker. For a
   concurrent service, give each worker its own `Session` over the shared
-  `Model`, or serialise behind a mutex.
+  `Model`, or serialise behind a mutex. `Sampler`, `Speculative` and
+  `ThinkingBudget` follow their worker; `ChatFormat::render` is read-only
+  and may run on any thread.
+- One `Multimodal` is shared (the projector file is gigabytes — loading it
+  per worker wastes GPU memory); lock around `eval`, one call at a time.
+  Text-only work never touches the lock. `examples/06_workers.cpp` is the
+  reference layout: queue, workers with private sessions, shared model and
+  projector.
 - The `cb_eval` path is `noexcept`; errors surface on the decoding thread via
   `require_frame_complete()`.
 - Backend initialisation happens once per process (`ensure_backend_initialized`,
@@ -513,13 +579,56 @@ uniform across requests and frames. Dtype is always float32, C-order.
 | `examples/02_batch.cpp` | many prompts through one session, `reset(seq)` between |
 | `examples/03_generate.cpp` | greedy generation, one frame per generated token |
 | `examples/04_raw_ggml.cpp` | the two-phase protocol on a raw CPU graph, no model |
-| `examples/05_service.cpp` | **one process: text gen, text extraction, image gen, image extraction** |
+| `examples/05_service.cpp` | **one process: text gen, text extraction, image gen, image extraction, draft generation** (`--draft`, `--thinking-budget`) |
+| `examples/06_workers.cpp` | **concurrent serving**: a job queue over worker threads, OCR + embedding jobs, shared projector |
 
 ```bash
 ./build/service_example -m gemma4.gguf --mmproj mmproj-gemma4.gguf \
     --image photo.jpg --image-prompt "What is in this picture?" \
-    -p "The capital of Italy is" -n 48 -l 20,29 -o out
+    -p "The capital of Italy is" -n 48 -l 20,29 -o out \
+    --draft mtp-gemma4.gguf --thinking-budget 128
 ```
+
+Jobs for `workers_example` are `mode<TAB>image-or--<TAB>prompt` lines with
+mode `ocr`, `ocr-states` or `embed`:
+
+```bash
+printf 'ocr\t-\tWhat is the capital of Italy?\nembed\tphoto.jpg\tWhat is shown?\n' > jobs.txt
+./build/workers_example -m gemma4.gguf --mmproj mmproj-gemma4.gguf \
+    --draft mtp-gemma4.gguf --jobs jobs.txt -o out -w 2 \
+    -c 32768 --batch 4096 --ubatch 2048 --thinking-budget 128 \
+    --image-min-tokens 560 --image-max-tokens 1120
+```
+
+Size workers × context to fit GPU memory, as with server slots: two workers
+at `-c 32768` with large images can exhaust it where one worker fits. Image
+token bounds only affect models with dynamic resolution, and need
+`--ubatch` past the max: one image decode carries that many tokens.
+
+## Serving (llama-server equivalent)
+
+This is a library, not a server: there is no HTTP layer and no
+`llama-server` binary. The equivalent of a server command is a small
+program on top of it (`examples/06_workers.cpp` is one). Flag mapping for
+a typical setup:
+
+| llama-server flag | Library equivalent |
+|---|---|
+| `-m`, `--mmproj` | `Model::load()`, `Multimodal` |
+| `-c`, `-b`, `-ub` | `SessionOptions::n_ctx/n_batch/n_ubatch` |
+| `-np 2` | two workers, one `Session` each (`n_seq_max` covers slots inside one session) |
+| `-ngl` | `ModelOptions::n_gpu_layers` |
+| `--model-draft` + `--spec-type draft-mtp` | `Speculative` (greedy, shared-memory heads) |
+| `--jinja` | `ChatFormat` (model's own template) |
+| `--reasoning-budget N` | `ThinkingBudget` with `max_tokens = N` (sequential path) |
+| `--image-min/max-tokens` | `MultimodalOptions::image_min/max_tokens` |
+| top-k / top-p / temp / seed | `SamplerOptions` |
+| `--host` / `--port` | yours: whatever feeds the job queue |
+
+Request routing per mode: embedding jobs record the prefill and never
+start the draft; OCR jobs generate with the draft when only text is
+needed, sequentially (armed, budgeted) when states are needed. Drafting
+while armed throws rather than record verification garbage.
 
 ---
 
@@ -533,11 +642,16 @@ ggml-extractor/
 │   ├── 02_batch.cpp
 │   ├── 03_generate.cpp
 │   ├── 04_raw_ggml.cpp
-│   └── 05_service.cpp
+│   ├── 05_service.cpp
+│   └── 06_workers.cpp
 ├── include/ggml_extractor/
 │   ├── backend.hpp           # process-wide backend init
 │   ├── model.hpp             # Model (shared weights)
 │   ├── session.hpp           # Session + SessionOptions + arm()
+│   ├── sampler.hpp           # Sampler + SamplerOptions
+│   ├── chat.hpp              # ChatFormat (Jinja prompt rendering)
+│   ├── thinking_budget.hpp   # ThinkingBudget
+│   ├── speculative.hpp       # Speculative (MTP draft generation)
 │   ├── capture.hpp           # HiddenStateCapture + HiddenStates
 │   ├── multimodal.hpp        # Multimodal (libmtmd)
 │   ├── extraction_request.hpp

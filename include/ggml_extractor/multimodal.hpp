@@ -18,6 +18,11 @@ struct MultimodalOptions {
     int n_threads = 4;
     /// Let libmtmd print its own encode timings.
     bool print_timings = false;
+    /// Image token bounds for models with dynamic resolution
+    /// (`--image-min/max-tokens` in llama-server). `-1` = read from the
+    /// projector file, like the server default.
+    int image_min_tokens = -1;
+    int image_max_tokens = -1;
 };
 
 /// @brief Vision and audio front end (llama.cpp's `libmtmd`) over a shared

@@ -21,6 +21,24 @@ set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
 
+# Prompt rendering uses llama.cpp's own Jinja engine, compiled straight from
+# the checkout (no common/ dependency). Fail early if a checkout predating
+# the engine's move to common/jinja is used.
+set(GGML_EXTRACTOR_JINJA_SOURCES
+    "${LLAMA_CPP_DIR}/common/jinja/lexer.cpp"
+    "${LLAMA_CPP_DIR}/common/jinja/parser.cpp"
+    "${LLAMA_CPP_DIR}/common/jinja/runtime.cpp"
+    "${LLAMA_CPP_DIR}/common/jinja/string.cpp"
+    "${LLAMA_CPP_DIR}/common/jinja/value.cpp"
+    "${LLAMA_CPP_DIR}/common/unicode.cpp"
+)
+foreach(jinja_source IN LISTS GGML_EXTRACTOR_JINJA_SOURCES)
+    if(NOT EXISTS "${jinja_source}")
+        message(FATAL_ERROR "Missing ${jinja_source}: this project needs a llama.cpp "
+                            "checkout with common/jinja (verified against 5ecbe1ac1)")
+    endif()
+endforeach()
+
 # libmtmd lives under llama.cpp's tools/ tree but ships a standalone build hook
 # that skips common/ and the CLI binaries.
 if(GGML_EXTRACTOR_MULTIMODAL)
@@ -34,19 +52,33 @@ find_package(Threads REQUIRED)
 set(GGML_EXTRACTOR_SOURCES
     src/backend.cpp
     src/capture.cpp
+    src/chat.cpp
     src/model.cpp
     src/npy_writer.cpp
+    src/sampler.cpp
     src/session.cpp
+    src/speculative.cpp
+    src/thinking_budget.cpp
 )
 if(GGML_EXTRACTOR_MULTIMODAL)
     list(APPEND GGML_EXTRACTOR_SOURCES src/multimodal.cpp)
 endif()
+list(APPEND GGML_EXTRACTOR_SOURCES ${GGML_EXTRACTOR_JINJA_SOURCES})
 
 add_library(ggml_extractor STATIC ${GGML_EXTRACTOR_SOURCES})
 target_include_directories(ggml_extractor PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+# Jinja headers ("jinja/lexer.h", "unicode.h") resolve inside the checkout.
+# So does the staging header "llama-ext.h" (MTP support, WIP upstream).
+target_include_directories(ggml_extractor PRIVATE
+    "${LLAMA_CPP_DIR}/common"
+    "${LLAMA_CPP_DIR}/src"
+    "${LLAMA_CPP_DIR}/vendor"
+)
+# Upstream sources build warning-free under their own flags, not ours.
+set_source_files_properties(${GGML_EXTRACTOR_JINJA_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
 target_compile_features(ggml_extractor PUBLIC cxx_std_17)
 target_link_libraries(ggml_extractor PUBLIC llama Threads::Threads)
 if(GGML_EXTRACTOR_MULTIMODAL)
@@ -68,6 +100,7 @@ set(GGML_EXTRACTOR_EXAMPLES
     generate_example examples/03_generate.cpp
     raw_ggml_example examples/04_raw_ggml.cpp
     service_example  examples/05_service.cpp
+    workers_example  examples/06_workers.cpp
 )
 
 list(LENGTH GGML_EXTRACTOR_EXAMPLES _example_entries)
